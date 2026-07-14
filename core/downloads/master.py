@@ -28,7 +28,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 import time
+import urllib.request
 import uuid
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -307,12 +309,92 @@ class _BatchStateAccessImpl:
                 row.update(fields)
 
     def mark_failed(self, batch_id: str, error: str) -> None:
+        failed_row = None
         with tasks_lock:
             row = download_batches.get(batch_id)
             if row is not None:
                 row['phase'] = 'failed'
                 row['error'] = error
                 row['album_bundle_state'] = 'failed'
+                failed_row = dict(row)
+        _ignore_unavailable_wishlist_album(failed_row, error)
+
+
+def _ignore_unavailable_wishlist_album(batch: dict | None, error: str) -> None:
+    """Defer wishlist album rows when atomic Soulseek cannot find a full album."""
+    if not batch:
+        return
+    if batch.get('playlist_id') not in ('wishlist', 'wishlist_manual'):
+        return
+    terminal_album_errors = (
+        'No complete Soulseek album folders found',
+        'No Soulseek album files could be enqueued',
+        'Soulseek album folder produced no usable files',
+        'staged only',
+    )
+    if not any(marker in str(error or '') for marker in terminal_album_errors):
+        return
+    if not _slskd_server_ready():
+        logger.warning(
+            "[Wishlist Guard] Keeping failed wishlist album because slskd is not logged in; "
+            "this looks transient, not an unavailable album"
+        )
+        return
+
+    album_context = batch.get('album_context') or {}
+    album_name = str(album_context.get('name') or '').strip()
+    if not album_name:
+        playlist_name = str(batch.get('playlist_name') or '')
+        match = re.search(r'Album: (.*?)\)$', playlist_name)
+        album_name = match.group(1).strip() if match else ''
+    if not album_name:
+        return
+
+    db_path = Path('/app/data/music_library.db')
+    if not db_path.exists():
+        db_path = Path('database/music_library.db')
+    if not db_path.exists():
+        db_path = Path('/app/database/music_library.db')
+    if not db_path.exists():
+        logger.warning("[Wishlist Guard] Cannot ignore unavailable album '%s': database not found", album_name)
+        return
+
+    try:
+        from core.wishlist.processing import _defer_wishlist_album_rows
+
+        short_reason = re.sub(r'\s+', ' ', str(error or 'unavailable')).strip()[:120]
+        deferred = _defer_wishlist_album_rows(
+            album_name,
+            f'soulseek_atomic_unavailable:{short_reason}',
+            logger=logger,
+        )
+        logger.warning(
+            "[Wishlist Guard] Deferred %s wishlist row(s) for unavailable complete album '%s'",
+            deferred, album_name,
+        )
+    except Exception as exc:
+        logger.warning("[Wishlist Guard] Failed to defer unavailable album '%s': %s", album_name, exc)
+
+
+def _slskd_server_ready() -> bool:
+    try:
+        config_path = Path('/app/config/config.json')
+        config = json.loads(config_path.read_text()) if config_path.exists() else {}
+        soulseek = config.get('soulseek') or {}
+        base_url = str(soulseek.get('slskd_url') or '').rstrip('/')
+        api_key = str(soulseek.get('api_key') or '')
+        if not base_url or not api_key:
+            return True
+        req = urllib.request.Request(
+            f'{base_url}/api/v0/server',
+            headers={'X-API-Key': api_key},
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+        return bool(payload.get('isConnected') and payload.get('isLoggedIn'))
+    except Exception as exc:
+        logger.warning("[Wishlist Guard] Could not verify slskd login state: %s", exc)
+        return False
 
 
 # Task states that mean a batch still has work in flight. While ANY of a batch's
@@ -981,6 +1063,21 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
         _bundle_state = _BatchStateAccessImpl()
         _album_bundle_source = _resolve_album_bundle_source(deps.config_manager)
         if _album_bundle_source == 'soulseek':
+            _expected_album_track_count = 0
+            try:
+                _expected_album_track_count = int((batch_album_context or {}).get('total_tracks') or 0)
+            except (TypeError, ValueError):
+                _expected_album_track_count = 0
+            if _expected_album_track_count <= 0:
+                _expected_album_track_count = len(tracks_json or [])
+            _soulseek_plugin_kwargs = {
+                'expected_track_count': _expected_album_track_count,
+            }
+            if preflight_source and preflight_tracks:
+                _soulseek_plugin_kwargs.update({
+                    'preferred_source': preflight_source,
+                    'preferred_tracks': preflight_tracks,
+                })
             if _album_bundle_dispatch.try_dispatch(
                 batch_id=batch_id,
                 is_album=batch_is_album,
@@ -990,10 +1087,7 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                 plugin_resolver=deps.download_orchestrator.client,
                 state=_bundle_state,
                 source_override=_album_bundle_source,
-                plugin_kwargs={
-                    'preferred_source': preflight_source,
-                    'preferred_tracks': preflight_tracks,
-                } if preflight_source and preflight_tracks else None,
+                plugin_kwargs=_soulseek_plugin_kwargs,
             ):
                 return
 
